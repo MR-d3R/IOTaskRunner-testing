@@ -8,6 +8,7 @@ import (
 	"taskrunner/pkg/rabbitmq"
 
 	"github.com/gin-gonic/gin"
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 func main() {
@@ -19,9 +20,13 @@ func main() {
 	logger := config.GetLogger()
 
 	// Подключение к RabbitMQ
-	conn, ch, err := rabbitmq.SetupRabbitMQ(cfg.RabbitMQURL, "tasks")
+	conn, err := amqp.Dial(cfg.RabbitMQURL)
 	if err != nil {
-		logger.Error("Failed to setup RabbitMQ: %v", err)
+		logger.Panic("error connecting to rabbitmq: %v", err)
+	}
+	ch, err := rabbitmq.SetupRabbitMQ(conn)
+	if err != nil {
+		logger.Panic("Failed to setup RabbitMQ: %v", err)
 	}
 	defer conn.Close()
 	defer ch.Close()

@@ -13,11 +13,10 @@ import (
 )
 
 type Config struct {
-	RabbitMQURL  string
-	PostgresAddr string
-	DB           *redis.Client
-	ServerPort   string
-	NewsAPIKey   string
+	RabbitMQURL string
+	DB          *redis.Client
+	ServerPort  string
+	NewsAPIKey  string
 }
 
 type YamlConfig struct {
@@ -29,13 +28,6 @@ type YamlConfig struct {
 	RabbitMQ struct {
 		Address string `yaml:"addr"`
 	} `yaml:"Rabbit"`
-
-	Postgres struct {
-		Address  string `yaml:"addr"`
-		User     string `yaml:"user"`
-		Password string `yaml:"password"`
-		DBName   string `yaml:"db_name"`
-	} `yaml:"Postgres"`
 
 	Redis struct {
 		Address     string `yaml:"addr"`
@@ -115,7 +107,6 @@ func initializeConfig(logPrefix string) (*Config, error) {
 
 	var cfg Config
 	cfg.RabbitMQURL = ymlCfg.RabbitMQ.Address
-	cfg.PostgresAddr = ymlCfg.Postgres.Address
 	cfg.DB = db
 	cfg.ServerPort = ymlCfg.Server.Port
 

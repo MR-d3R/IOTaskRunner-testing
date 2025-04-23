@@ -15,7 +15,7 @@ import (
 // Конфигурация для тестов
 const (
 	serviceURL      = "http://localhost:8080"
-	numRequests     = 100              // Общее количество запросов
+	numRequests     = 1000             // Общее количество запросов
 	maxConcurrent   = 50               // Максимальное количество параллельных запросов
 	requestTimeout  = 5 * time.Second  // Таймаут для каждого запроса
 	statusInterval  = 20 * time.Second // Интервал между проверками статуса
