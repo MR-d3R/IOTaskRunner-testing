@@ -19,6 +19,7 @@ import (
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/redis/go-redis/v9"
 )
 
 // Константы для настройки воркеров и очередей
@@ -59,6 +60,8 @@ type WorkerPool struct {
 	nextWorkerId    int
 	queueStats      *QueueStats
 	loadMonitorDone chan struct{}
+	startTime       time.Time
+	healthy         bool
 }
 
 // Статистика очереди для динамического масштабирования
@@ -86,6 +89,8 @@ func NewWorkerPool(initialWorkerCount int, cfg *config.Config, logger *logger.Co
 		nextWorkerId:    1,
 		queueStats:      &QueueStats{lastCheck: time.Now()},
 		loadMonitorDone: make(chan struct{}),
+		startTime:       time.Now(),
+		healthy:         true,
 	}
 
 	// Создаем начальное количество воркеров
@@ -96,7 +101,6 @@ func NewWorkerPool(initialWorkerCount int, cfg *config.Config, logger *logger.Co
 		}
 	}
 
-	// Если не удалось создать ни одного воркера, возвращаем ошибку
 	if len(pool.workers) == 0 {
 		return nil, fmt.Errorf("failed to create any workers")
 	}
@@ -128,12 +132,10 @@ func (wp *WorkerPool) RemoveWorker() bool {
 	wp.workersMutex.Lock()
 	defer wp.workersMutex.Unlock()
 
-	// Не удалять, если достигнут минимум
 	if len(wp.workers) <= MinWorkerCount {
 		return false
 	}
 
-	// Находим воркера с наименьшей активностью для удаления
 	var oldestWorker *Worker
 	var oldestWorkerId int
 	oldestTime := time.Now()
@@ -168,14 +170,12 @@ func (wp *WorkerPool) Start() {
 
 	wp.wg.Add(workerCount)
 
-	// Запускаем всех текущих воркеров
 	wp.workersMutex.RLock()
 	for _, worker := range wp.workers {
 		go worker.Run()
 	}
 	wp.workersMutex.RUnlock()
 
-	// Запускаем мониторинг нагрузки
 	go wp.monitorQueueLoad()
 }
 
@@ -256,7 +256,6 @@ func (wp *WorkerPool) adjustWorkerCount() {
 
 // Получение текущей глубины очереди
 func (wp *WorkerPool) getQueueDepth() int {
-	// Для получения реального количества сообщений в очереди создаем временное соединение
 	conn, err := amqp.Dial(wp.cfg.RabbitMQURL)
 	if err != nil {
 		wp.logger.Error("Failed to connect to RabbitMQ to check queue depth: %v", err)
@@ -311,7 +310,7 @@ func (wp *WorkerPool) updateProcessingStats(processingTime time.Duration) {
 // Ожидание завершения всех воркеров
 func (wp *WorkerPool) Wait() {
 	wp.wg.Wait()
-	<-wp.loadMonitorDone // Дожидаемся завершения мониторинга нагрузки
+	<-wp.loadMonitorDone
 }
 
 // Остановка всех воркеров
@@ -340,7 +339,6 @@ func NewWorker(id int, ctx context.Context, cfg *config.Config, logger *logger.C
 		lastActivity:    time.Now(),
 	}
 
-	// Соединение будет установлено при запуске воркера
 	return worker, nil
 }
 
@@ -403,7 +401,6 @@ func (w *Worker) connect() error {
 		case <-w.ctx.Done():
 			return fmt.Errorf("context canceled during reconnect")
 		case <-time.After(time.Second * time.Duration(ReconnectDelay)):
-			// Пауза перед следующей попыткой
 		}
 
 		attempts++
@@ -486,16 +483,12 @@ func (w *Worker) Run() {
 
 runLoop:
 	for {
-		// Проверяем, не отменен ли контекст
 		select {
 		case <-w.ctx.Done():
 			w.logger.Info("[Worker %d] Received shutdown signal, stopping", w.workerId)
 			break runLoop
 		default:
-			// Продолжаем работу
 		}
-
-		// Устанавливаем соединение с RabbitMQ, если нужно
 		if w.conn == nil || w.channel == nil {
 			if err := w.connect(); err != nil {
 				w.logger.Error("[Worker %d] Failed to connect: %v. Stopping worker.", w.workerId, err)
@@ -505,13 +498,13 @@ runLoop:
 
 		// Подписка на очередь
 		msgs, err := w.channel.Consume(
-			rabbitmq.MainQueueName, // queue
-			"",                     // consumer (пустая строка = автогенерация имени)
-			false,                  // auto-ack (ручное подтверждение)
-			false,                  // exclusive
-			false,                  // no-local
-			false,                  // no-wait
-			nil,                    // args
+			rabbitmq.MainQueueName,
+			"",
+			false,
+			false,
+			false,
+			false,
+			nil,
 		)
 		if err != nil {
 			w.logger.Error("[Worker %d] Failed to register as consumer: %v", w.workerId, err)
@@ -541,18 +534,15 @@ runLoop:
 					break consumeLoop
 				}
 
-				// Обновляем время последней активности
 				w.mutex.Lock()
 				w.lastActivity = time.Now()
 				w.mutex.Unlock()
 
-				// Обработка сообщения
 				w.processMessage(d)
 			}
 		}
 	}
 
-	// Закрываем соединения перед выходом
 	w.closeConnections()
 	w.mutex.Lock()
 	w.active = false
@@ -565,7 +555,6 @@ func (w *Worker) processMessage(d amqp.Delivery) {
 	startTime := time.Now()
 	w.logger.Debug("[Worker %d] Received a message: %s", w.workerId, d.Body)
 
-	// Проверяем счетчик повторных попыток
 	headers := d.Headers
 	var retryCount int32 = 0
 
@@ -589,7 +578,6 @@ func (w *Worker) processMessage(d amqp.Delivery) {
 		w.workerId, task.ID, task.URL, retryCount)
 
 	if task.URL == "" {
-		// Сохраняем ошибку в Redis
 		err := w.cfg.DB.HSet(w.ctx, "task:"+task.ID,
 			"status", "error",
 			"result", "empty URL provided",
@@ -598,7 +586,6 @@ func (w *Worker) processMessage(d amqp.Delivery) {
 			w.logger.Error("[Worker %d] Error saving error result to Redis: %v", w.workerId, err)
 		}
 
-		// Устанавливаем TTL
 		w.cfg.DB.Expire(w.ctx, "task:"+task.ID, time.Hour)
 
 		// Пустые URL отправляем в DLQ после первой же попытки
@@ -607,7 +594,6 @@ func (w *Worker) processMessage(d amqp.Delivery) {
 		return
 	}
 
-	// Пробуем получить статус URL
 	var status string
 	var err error
 
@@ -619,18 +605,12 @@ func (w *Worker) processMessage(d amqp.Delivery) {
 		status = w.checkURLStatus(task.URL)
 	}
 
-	// Если произошла ошибка и не исчерпаны попытки
 	if strings.HasPrefix(status, "error:") && retryCount < MessageRetryCount-1 {
-		// Увеличиваем счетчик повторных попыток
 		retryCount++
-
-		// Подготавливаем заголовки для повторной отправки
 		if headers == nil {
 			headers = amqp.Table{}
 		}
 		headers["x-retry-count"] = retryCount
-
-		// Повторно публикуем сообщение в очередь
 		err = w.channel.Publish(
 			"",                     // exchange
 			rabbitmq.MainQueueName, // routing key
@@ -648,14 +628,12 @@ func (w *Worker) processMessage(d amqp.Delivery) {
 			w.logger.Error("[Worker %d] Error re-publishing message: %v", w.workerId, err)
 		}
 
-		// Подтверждаем обработку исходного сообщения
 		d.Ack(false)
 		w.logger.Info("[Worker %d] Task %s failed with error, retrying (attempt %d/%d)",
 			w.workerId, task.ID, retryCount, MessageRetryCount)
 		return
 	}
 
-	// Сохраняем результат
 	err = w.cfg.DB.HSet(w.ctx, "task:"+task.ID,
 		"status", "done",
 		"result", status,
@@ -667,13 +645,11 @@ func (w *Worker) processMessage(d amqp.Delivery) {
 		w.logger.Info("[Worker %d] Result saved to Redis for task %s", w.workerId, task.ID)
 	}
 
-	// Устанавливаем TTL
 	err = w.cfg.DB.Expire(w.ctx, "task:"+task.ID, time.Hour).Err()
 	if err != nil {
 		w.logger.Error("[Worker %d] Error setting TTL: %v", w.workerId, err)
 	}
 
-	// Обновляем статистику
 	processingTime := time.Since(startTime)
 	w.workerPool.updateProcessingStats(processingTime)
 
@@ -683,7 +659,6 @@ func (w *Worker) processMessage(d amqp.Delivery) {
 			w.workerId, task.ID, retryCount+1)
 		d.Nack(false, false)
 	} else {
-		// Подтверждаем обработку сообщения
 		d.Ack(false)
 		w.logger.Info("[Worker %d] Task %s completed and acknowledged in %v",
 			w.workerId, task.ID, processingTime)
@@ -759,6 +734,43 @@ func max(a, b int) int {
 	return b
 }
 
+// Добавьте функцию для обновления статистики в Redis
+func (wp *WorkerPool) updateStatsInRedis(redisClient *redis.Client) {
+	// Запускаем периодическое обновление
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-wp.ctx.Done():
+			return
+		case <-ticker.C:
+			wp.workersMutex.RLock()
+			workerCount := len(wp.workers)
+			wp.workersMutex.RUnlock()
+
+			wp.queueStats.mutex.Lock()
+			stats := map[string]interface{}{
+				"healthy":             wp.healthy,
+				"uptime":              time.Since(wp.startTime).Seconds(),
+				"workers":             workerCount,
+				"messages_in_queue":   wp.queueStats.messagesInQueue,
+				"messages_per_second": wp.queueStats.messagesPerSecond,
+				"avg_processing_time": wp.queueStats.avgProcessingTime.Milliseconds(),
+				"total_processed":     wp.queueStats.totalProcessedCount,
+				"last_update":         time.Now().Unix(),
+			}
+			wp.queueStats.mutex.Unlock()
+
+			// Сохраняем в Redis
+			jsonData, err := json.Marshal(stats)
+			if err == nil {
+				redisClient.Set(wp.ctx, "consumer:health_stats", jsonData, 30*time.Second)
+			}
+		}
+	}
+}
+
 func main() {
 	// Инициализация конфигурации
 	cfg, err := config.InitConfig("CONSUMER")
@@ -786,18 +798,16 @@ func main() {
 	workerPool.Start()
 	logger.Info("Started worker pool with %d initial workers", InitialWorkerCount)
 
-	// Настраиваем перехват сигналов для graceful shutdown
+	go workerPool.updateStatsInRedis(cfg.DB)
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Ожидаем сигнала завершения
 	sig := <-sigChan
 	logger.Info("Received shutdown signal: %v", sig)
 
-	// Выполняем graceful shutdown
 	logger.Info("Initiating graceful shutdown...")
 
-	// Создаем контекст с таймаутом для graceful shutdown
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -810,7 +820,6 @@ func main() {
 		}
 	}()
 
-	// Останавливаем пул воркеров
 	logger.Info("Stopping worker pool...")
 	workerPool.Stop()
 

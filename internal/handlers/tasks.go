@@ -7,6 +7,7 @@ import (
 	"strings"
 	"taskrunner/internal/models"
 	"taskrunner/logger"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -47,7 +48,6 @@ func (h *TaskHandler) CreateTask(c *gin.Context) {
 		return
 	}
 
-	// Проверка, что URL имеет правильный формат
 	if !strings.HasPrefix(input.URL, "http://") && !strings.HasPrefix(input.URL, "https://") {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "URL must start with http:// or https://"})
 		return
@@ -85,7 +85,52 @@ func (h *TaskHandler) CreateTask(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"task_id": taskID})
 }
 
-// GetTaskStatus получает статус задачи по ID
+// GetHealthStatus в TaskHandler
+func (h *TaskHandler) GetHealthStatus(c *gin.Context) {
+	jsonData, err := h.RedisClient.Get(h.Ctx, "consumer:health_stats").Result()
+	if err != nil {
+		if err == redis.Nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"status": "unhealthy",
+				"reason": "consumer stats not available",
+			})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"status": "error",
+				"reason": "failed to fetch consumer stats",
+			})
+		}
+		return
+	}
+
+	// Проверяем актуальность данных (не старше 30 секунд)
+	var stats map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonData), &stats); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "reason": "invalid stats data"})
+		return
+	}
+
+	lastUpdate, ok := stats["last_update"].(float64)
+	if !ok || time.Now().Unix()-int64(lastUpdate) > 30 {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"status": "unhealthy",
+			"reason": "consumer stats outdated",
+		})
+		return
+	}
+
+	// Преобразуем uptime и avg_processing_time обратно в читаемый формат
+	if uptime, ok := stats["uptime"].(float64); ok {
+		stats["uptime"] = (time.Duration(uptime) * time.Second).String()
+	}
+
+	if avgTime, ok := stats["avg_processing_time"].(float64); ok {
+		stats["avg_processing_time"] = (time.Duration(avgTime) * time.Millisecond).String()
+	}
+
+	c.JSON(http.StatusOK, stats)
+}
+
 func (h *TaskHandler) GetTaskStatus(c *gin.Context) {
 	id := c.Param("id")
 	result, err := h.RedisClient.HGetAll(h.Ctx, "task:"+id).Result()
@@ -99,7 +144,6 @@ func (h *TaskHandler) GetTaskStatus(c *gin.Context) {
 
 // GetAllTasks получает список всех задач
 func (h *TaskHandler) GetAllTasks(c *gin.Context) {
-	// Используем паттерн для получения всех ключей tasks:*
 	keys, err := h.RedisClient.Keys(h.Ctx, "task:*").Result()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch tasks"})
@@ -128,20 +172,17 @@ func (h *TaskHandler) GetAllTasks(c *gin.Context) {
 func (h *TaskHandler) CancelTask(c *gin.Context) {
 	id := c.Param("id")
 
-	// Проверяем статус задачи
 	status, err := h.RedisClient.HGet(h.Ctx, "task:"+id, "status").Result()
 	if err != nil || status == "" {
 		c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
 		return
 	}
 
-	// Если задача уже выполнена, отмена невозможна
 	if status == "done" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "task already completed"})
 		return
 	}
 
-	// Обновляем статус
 	err = h.RedisClient.HSet(h.Ctx, "task:"+id, "status", "cancelled").Err()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to cancel task"})
@@ -154,6 +195,7 @@ func (h *TaskHandler) CancelTask(c *gin.Context) {
 // RegisterRoutes регистрирует все маршруты для задач
 func (h *TaskHandler) RegisterRoutes(router *gin.Engine) {
 	router.POST("/task", h.CreateTask)
+	router.GET("/health", h.GetHealthStatus)
 	router.GET("/task/:id", h.GetTaskStatus)
 	router.GET("/tasks", h.GetAllTasks)
 	router.POST("/task/:id/cancel", h.CancelTask)
